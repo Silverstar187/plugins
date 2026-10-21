@@ -107,7 +107,7 @@ With `-continue`, TLC exits 0 after a broken rule, and its output still ends wit
    node scripts/compare-charts.mjs chart.mmd drawn.mmd
    ```
 
-   Draw the comparison chart with `--highlight 0 --all-labels`, without `--cover` or `--fixed-dot`. `compare-charts.mjs` refuses other charts and exits 2. It compares the combined machine of all regions, so a guard that blocks a step in only some combinations of region states shows as a difference. It prints `same` and exits 0 when the states, start states, and transitions match, and exits 1 when they differ. It also lists region states that the agreed chart's own steps never reach. A broken rule here is a design bug in the agreed chart, found before any code. Take it back to the reader.
+   Draw the comparison chart with `--highlight 0 --all-labels`, without `--cover` or `--fixed-dot`. `compare-charts.mjs` refuses a chart drawn any other way, or a chart it cannot read, and exits 2. It compares the combined machine of all regions, so a guard that blocks a step in only some combinations of region states shows as a difference. It prints `same` and exits 0 when the states, start states, and transitions match, and exits 1 when they differ. It also lists region states that the agreed chart's own steps never reach. A broken rule here is a design bug in the agreed chart, found before any code. Take it back to the reader.
 
 4. **Add the real code.** Add guards and variables from the code to `Sync.tla`, and repeat step 3. Each difference `compare-charts.mjs` prints is a place where the code does not do what the chart says. Give each one to the reader to decide. It is a bug in the code or a correction to the chart.
 

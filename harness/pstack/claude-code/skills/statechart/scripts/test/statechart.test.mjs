@@ -302,15 +302,19 @@ test("a -- outside a composite is refused, not read as one region", () => {
 	assert.match(tla.stderr, /-- outside a composite/);
 	for (const pair of [["split.mmd", "split.mmd"], ["door.mmd", "split.mmd"], ["split.mmd", "door.mmd"]]) {
 		const r = node("compare-charts.mjs", pair, dir);
-		assert.notEqual(r.status, 0, pair.join(" "));
-		assert.notEqual(r.stdout.trim(), "same");
-		assert.match(r.stderr, /-- outside a composite/);
+		assert.equal(r.status, 2, pair.join(" "));
+		assert.match(r.stderr, /^split\.mmd: the chart has -- outside a composite/);
 	}
 });
 
-test("compare refuses an ACTUAL chart that is not drawn for comparison", () => {
+test("compare refuses a chart it cannot read, or an ACTUAL chart that is not drawn for comparison", () => {
 	const dir = mkdtempSync(join(tmpdir(), "statechart-"));
 	writeFileSync(join(dir, "agreed.mmd"), door);
+	for (const pair of [["agreed.mmd", "missing.mmd"], ["missing.mmd", "agreed.mmd"]]) {
+		const r = node("compare-charts.mjs", pair, dir);
+		assert.equal(r.status, 2, pair.join(" "));
+		assert.match(r.stderr, /^missing\.mmd: ENOENT/);
+	}
 	for (const [label, why] of [
 		["tap lock or …", /--all-labels/],
 		["1. tap lock", /--highlight 0/],

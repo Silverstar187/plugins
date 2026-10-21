@@ -10,7 +10,7 @@
 // difference. A combined state is the region states joined by " | " in region order, which is what
 // chart-to-tla.mjs's mapping writes. An edge label "a or b" counts as two labels. An unlabeled edge counts
 // only when no labeled edge joins the same two states, because tlc-to-chart.mjs draws only the labels.
-// Exits 1 when the charts differ and 2 when ACTUAL is not drawn for comparison.
+// Exits 1 when the charts differ, and 2 when it cannot read a chart or ACTUAL is not drawn for comparison.
 import fs from "node:fs";
 import process from "node:process";
 import { parseMermaid, productOf } from "./lib.mjs";
@@ -25,9 +25,17 @@ const machine = (regions) => {
 	const rs = Object.values(regions);
 	return rs.length === 1 ? rs[0] : productOf(regions);
 };
-const expectedRegions = parseMermaid(fs.readFileSync(expectedFile, "utf8")).regions;
+const read = (file) => {
+	try {
+		return parseMermaid(fs.readFileSync(file, "utf8")).regions;
+	} catch (e) {
+		console.error(`${file}: ${e.message}`);
+		process.exit(2);
+	}
+};
+const expectedRegions = read(expectedFile);
 const expected = machine(expectedRegions);
-const actual = machine(parseMermaid(fs.readFileSync(actualFile, "utf8")).regions);
+const actual = machine(read(actualFile));
 
 const refusals = [
 	[(l) => / or …$/.test(l), "an edge label ends in \" or …\"; draw ACTUAL with --all-labels"],
