@@ -130,53 +130,83 @@ function unescapeDot(s) {
 	return out;
 }
 
+// Returns { nodes, edges, loops }. loops are steps that change no variable; they count as enabled
+// actions but are not transitions.
 export function parseDot(text) {
 	const nodes = new Map();
 	const edges = [];
+	const loops = [];
+	const seen = new Set();
 	const LABEL = '"((?:[^"\\\\]|\\\\.)*)"';
 	const nodeRe = new RegExp(`^(-?\\d+) \\[label=${LABEL}(.*)\\];?\\s*$`);
 	const edgeRe = new RegExp(`^(-?\\d+) -> (-?\\d+)(?: \\[label=${LABEL})?`);
 	for (const line of text.split("\n")) {
 		let m = edgeRe.exec(line);
 		if (m) {
-			if (m[1] !== m[2]) edges.push({ from: m[1], to: m[2], action: m[3] ? unescapeDot(m[3]) : "" });
+			const e = { from: m[1], to: m[2], action: m[3] ? unescapeDot(m[3]) : "" };
+			const id = `${e.from} ${e.to} ${e.action}`;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			(e.from === e.to ? loops : edges).push(e);
 			continue;
 		}
 		m = nodeRe.exec(line);
 		if (m) nodes.set(m[1], { id: m[1], vars: parseState(unescapeDot(m[2])), init: /style\s*=\s*filled/.test(m[3]) });
 	}
 	if (nodes.size === 0) throw new Error("no states found; dump the graph with TLC -dump dot,actionlabels <file>");
-	const missing = edges.find((e) => !nodes.has(e.from) || !nodes.has(e.to));
+	const missing = [...edges, ...loops].find((e) => !nodes.has(e.from) || !nodes.has(e.to));
 	if (missing) throw new Error(`transition ${missing.from} -> ${missing.to} names a state the file does not define`);
-	return { nodes, edges };
+	if (edges.length > 0 && [...edges, ...loops].every((e) => !e.action)) throw new Error("the graph has no action names; dump it with TLC -dump dot,actionlabels <file>");
+	return { nodes, edges, loops };
 }
 
 // ---------- TLC error traces (one per violation; many with -continue) ----------
 
+// A trace that follows an error other than a broken invariant has invariant null.
 export function parseTraces(text) {
 	const traces = [];
 	let invariant = null;
 	let current = null;
 	const lines = text.split("\n");
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i];
-		const inv = /^Error: Invariant (\S+) is violated/.exec(line);
-		if (inv) {
-			invariant = inv[1];
-			continue;
-		}
-		const head = /^State (\d+): <([^\s>(]+)/.exec(line);
-		if (!head) continue;
+	const stateAt = (i) => {
 		const body = [];
 		while (i + 1 < lines.length && lines[i + 1].trim() !== "") body.push(lines[++i]);
-		const step = { action: head[2] === "Initial" ? null : head[2], vars: parseState(body.join("\n")) };
+		return [parseState(body.join("\n")), i];
+	};
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const inv = /^Error: Invariant (\S+) is violated( by the initial state:)?/.exec(line);
+		if (inv) {
+			invariant = inv[1];
+			if (inv[2]) {
+				const [vars, end] = stateAt(i);
+				traces.push({ invariant, steps: [{ action: null, vars }] });
+				i = end;
+			}
+			continue;
+		}
+		if (line.startsWith("Error: ") && !line.startsWith("Error: The behavior up to this point is")) invariant = null;
+		const head = /^State (\d+): <([^\s>(]+)/.exec(line);
+		if (!head) continue;
+		const [vars, end] = stateAt(i);
+		i = end;
 		if (head[1] === "1") {
 			current = { invariant, steps: [] };
 			traces.push(current);
 		}
-		current?.steps.push(step);
+		current?.steps.push({ action: head[2] === "Initial" ? null : head[2], vars });
 	}
 	return traces;
+}
+
+// Throws unless TLC finished and every error it printed is a broken invariant. With -continue, TLC
+// prints "Model checking completed" even after broken invariants, and not when it stopped early.
+export function checkTlcOutput(text, file) {
+	const other = text
+		.split("\n")
+		.find((l) => l.startsWith("Error: ") && !/^Error: (Invariant \S+ is violated|The behavior up to this point is)/.test(l));
+	if (other) throw new Error(`${file}: TLC stopped on an error that is not a broken rule: ${other.slice(7)}`);
+	if (!/^Model checking completed\./m.test(text)) throw new Error(`${file}: TLC did not finish, so its counterexamples are not all there; read the file`);
 }
 
 // ---------- Mermaid stateDiagram-v2 (the subset these scripts write and read) ----------
@@ -195,7 +225,15 @@ export function wrap(text, width = 26) {
 	return rows.join("<br/>");
 }
 
-const unwrap = (s) => s.replace(/<br\s*\/?>/g, " ").replace(/\s+/g, " ").trim();
+const unwrap = (s) =>
+	s
+		.replace(/<br\s*\/?>/g, " ")
+		.replace(/#(quot|34);/g, '"')
+		.replace(/\s+/g, " ")
+		.trim();
+
+// Mermaid ends a quoted state caption at the first ", so a caption writes " as #quot;.
+export const quote = (s) => String(s).replaceAll('"', "#quot;");
 
 // The scripts draw their legend as a composite with this id. It is not part of the machine.
 export const LEGEND_ID = "legend";
@@ -212,8 +250,20 @@ export function parseMermaid(text) {
 	const stack = [root];
 	const part = () => stack[stack.length - 1].parts.at(-1);
 	const display = (id) => names.get(id) ?? id;
+	// As in Mermaid, a state that only transitions name belongs to the part where it first appears.
+	const implicit = new Map();
+	const declare = (id) => {
+		const prev = implicit.get(id);
+		if (prev) prev.children.splice(prev.children.findIndex((c) => c.name === id), 1);
+		implicit.set(id, null);
+	};
+	const mention = (id) => {
+		if (id === "[*]" || implicit.has(id)) return;
+		part().children.push({ name: id, leaf: true });
+		implicit.set(id, part());
+	};
 	for (const raw of text.split("\n")) {
-		const line = raw.trim();
+		const line = raw.trim().replace(/(\[\*\]|[A-Za-z_]\w*):::[\w-]+/g, "$1");
 		const never = /^%%\s*never\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)(?:\s+--\s+(.*))?$/.exec(line);
 		if (never) {
 			nevers.push({ name: never[1], states: never[2].split("&").map((s) => s.trim()), sentence: never[3] ?? "" });
@@ -226,7 +276,8 @@ export function parseMermaid(text) {
 			if (plain) m = [line, null, plain[1], plain[2]];
 		}
 		if (m) {
-			if (m[1] !== null) names.set(m[2], unwrap(m[1]));
+			if (m[1] !== null && !names.has(m[2])) names.set(m[2], unwrap(m[1]));
+			declare(m[2]);
 			if (m[3]) {
 				const node = { name: m[2], parts: [newPart()] };
 				part().children.push(node);
@@ -245,12 +296,18 @@ export function parseMermaid(text) {
 		}
 		m = /^(\[\*\]|[A-Za-z_]\w*)\s*-->\s*(\[\*\]|[A-Za-z_]\w*)(?:\s*:\s*(.*))?$/.exec(line);
 		if (m) {
+			if (m[2] === "[*]" && m[1] !== "[*]") throw new Error(`cannot read final state in "${line}"; draw the step to the state the reader sees next`);
+			mention(m[1]);
+			mention(m[2]);
 			part().transitions.push({ from: m[1], to: m[2], label: m[3] ? unwrap(m[3]) : "" });
 			continue;
 		}
 		m = /^([A-Za-z_]\w*)\s*:\s*(.*)$/.exec(line);
 		if (m) {
-			names.set(m[1], unwrap(m[2]));
+			// Mermaid shows every description line; the first one names the state.
+			if (!names.has(m[1])) names.set(m[1], unwrap(m[2]));
+			if (implicit.get(m[1]) === null) continue;
+			declare(m[1]);
 			part().children.push({ name: m[1], leaf: true });
 			continue;
 		}
@@ -295,6 +352,7 @@ export function parseMermaid(text) {
 				}
 				const full = `${prefix}${display(c.name)}`;
 				if (c.leaf) {
+					if (out.states.has(full)) throw new Error(`two states have the caption "${full}"; give each its own caption`);
 					out.states.add(full);
 					info.set(c.name, { all: [full], initial: [full], depth });
 					all.push(full);
@@ -348,6 +406,64 @@ export function parseMermaid(text) {
 		}
 	} else regions.Main = region(top);
 	return { regions, nevers };
+}
+
+// The combined machine of a chart's regions, as chart-to-tla.mjs generates it. A labeled step can
+// happen when at least one region can take it; every region that can take it moves, the others stay.
+// An unlabeled transition moves its own region only. A combined state is the region states joined
+// by " | " in region order. Only states reachable from the start are kept, and steps that change
+// nothing are dropped, as TLC's state graph drops them.
+export function productOf(regions) {
+	const rs = Object.values(regions);
+	const join = (parts) => parts.join(" | ");
+	const byLabel = new Map();
+	const unlabeled = [];
+	rs.forEach((r, ri) => {
+		for (const t of r.transitions) {
+			if (!t.label) {
+				unlabeled.push({ ri, from: t.from, to: t.to });
+				continue;
+			}
+			if (!byLabel.has(t.label)) byLabel.set(t.label, rs.map(() => new Map()));
+			const moves = byLabel.get(t.label)[ri];
+			if (!moves.has(t.from)) moves.set(t.from, new Set());
+			moves.get(t.from).add(t.to);
+		}
+	});
+	let starts = [[]];
+	for (const r of rs) starts = starts.flatMap((p) => [...r.initial].map((s) => [...p, s]));
+	const out = { states: new Set(), initial: new Set(starts.map(join)), transitions: [] };
+	const seen = new Set(starts.map(join));
+	const queue = [...starts];
+	const step = (from, to, label) => {
+		const [a, b] = [join(from), join(to)];
+		if (a === b) return;
+		out.transitions.push({ from: a, to: b, label });
+		if (!seen.has(b)) {
+			seen.add(b);
+			queue.push(to);
+		}
+	};
+	while (queue.length) {
+		const cur = queue.shift();
+		out.states.add(join(cur));
+		for (const u of unlabeled) {
+			if (cur[u.ri] !== u.from) continue;
+			const next = [...cur];
+			next[u.ri] = u.to;
+			step(cur, next, "");
+		}
+		for (const [label, perRegion] of byLabel) {
+			if (!perRegion.some((moves, ri) => moves.has(cur[ri]))) continue;
+			let nexts = [[]];
+			perRegion.forEach((moves, ri) => {
+				const tos = moves.has(cur[ri]) ? [...moves.get(cur[ri])] : [cur[ri]];
+				nexts = nexts.flatMap((p) => tos.map((s) => [...p, s]));
+			});
+			for (const next of nexts) step(cur, next, label);
+		}
+	}
+	return out;
 }
 
 export const STATUS_CLASSES = [

@@ -10,13 +10,16 @@
 //                     readerActions (the actions the reader takes).
 //                     facts.enabled is the set of actions the state enables; facts.settled is true when
 //                     only reader actions are enabled, so nothing else happens until the reader acts.
-//   --traces FILE     TLC output that holds counterexamples (repeat; -continue gives one per bad state)
+//   --traces FILE     TLC output that holds counterexamples (repeat; -continue gives one per bad state).
+//                     A file from a TLC run that stopped early or hit an error other than a broken rule is refused.
 //   --fixed-dot FILE  state graph of the model with the open fix; counterexamples replay against it
-//   --fixed-traces F  TLC output for the same invariants on the fixed model (repeat); marks states fixed or still wrong
+//   --fixed-traces F  TLC output for the same invariants on the fixed model (repeat); marks states fixed or still
+//                     wrong, and adds the bugs that only the fixed model has after the current model's bugs
 //   --view NAME       customer (state labels), developer (detail labels), or layered (detail inside state)
 //   --cover           keep only the shortest path to each settled reader state, plus counterexample paths
 //   --highlight N     draw counterexample class N as a numbered path (default 1; 0 for none)
 //   --path-only       draw only the highlighted path
+//   --all-labels      write every label on an edge (default: the two most common, then " or …")
 //   --title TEXT      chart title
 //   --out FILE        Mermaid output (default stdout)
 //   --story FILE      reader stories, one per counterexample class
@@ -25,7 +28,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { LEGEND_ID, parseDot, parseTraces, stateKey, wrap, STATUS_CLASSES } from "./lib.mjs";
+import { LEGEND_ID, checkTlcOutput, parseDot, parseTraces, quote, stateKey, wrap, STATUS_CLASSES } from "./lib.mjs";
 
 const args = { traces: [], fixedTraces: [], view: "customer", highlight: 1 };
 for (let i = 2; i < process.argv.length; i++) {
@@ -39,6 +42,7 @@ for (let i = 2; i < process.argv.length; i++) {
 	else if (a === "--view") args.view = next();
 	else if (a === "--highlight") args.highlight = Number(next());
 	else if (a === "--path-only") args.pathOnly = true;
+	else if (a === "--all-labels") args.allLabels = true;
 	else if (a === "--cover") args.cover = true;
 	else if (a === "--title") args.title = next();
 	else if (a === "--out") args.out = next();
@@ -93,7 +97,7 @@ function quotient(graph) {
 		const label = stepLabel(e.action, graph.nodes.get(e.from).vars, graph.nodes.get(e.to).vars);
 		if (label) edges.get(id).counts.set(label, (edges.get(id).counts.get(label) ?? 0) + 1);
 	}
-	// Most common wording first. A chart edge shows two at most.
+	// Most common wording first. A chart edge shows two unless --all-labels.
 	for (const e of edges.values()) e.labels = new Set([...e.counts].sort((a, b) => b[1] - a[1]).map(([l]) => l));
 	const settled = new Set([...graph.nodes.values()].filter((n) => factsOf(n.vars).settled).map((n) => keys.get(n.id)));
 	return { nodes, initial, edges, keys, settled };
@@ -101,7 +105,7 @@ function quotient(graph) {
 
 function enabledIndex(g) {
 	const byId = new Map([...g.nodes.keys()].map((id) => [id, new Set()]));
-	for (const e of g.edges) byId.get(e.from).add(e.action);
+	for (const e of [...g.edges, ...g.loops]) byId.get(e.from).add(e.action);
 	return new Map([...g.nodes.values()].map((n) => [stateKey(n.vars), byId.get(n.id)]));
 }
 function useFacts(index) {
@@ -141,7 +145,7 @@ function replayFixed(trace) {
 	if (!fixedGraph) return null;
 	const byKey = new Map([...fixedGraph.nodes.values()].map((n) => [stateKey(n.vars), n]));
 	const out = new Map();
-	for (const e of fixedGraph.edges) {
+	for (const e of [...fixedGraph.edges, ...fixedGraph.loops]) {
 		if (!out.has(e.from)) out.set(e.from, []);
 		out.get(e.from).push(e);
 	}
@@ -166,10 +170,16 @@ function replayFixed(trace) {
 	return { step: trace.steps.length, sameEnd: true };
 }
 
+function readTraces(files) {
+	return files.flatMap((f) => {
+		const text = fs.readFileSync(f, "utf8");
+		checkTlcOutput(text, f);
+		return parseTraces(text);
+	});
+}
 // With -continue, TLC reports every bad state, including states after the first bad one.
 // Cut each trace at its first bad state so one bug counts once.
-function firstBad(files) {
-	const raw = files.flatMap((f) => parseTraces(fs.readFileSync(f, "utf8")));
+function firstBad(raw) {
 	const badStates = new Map();
 	for (const t of raw) {
 		if (!badStates.has(t.invariant)) badStates.set(t.invariant, new Set());
@@ -187,38 +197,78 @@ function firstBad(files) {
 	}
 	return cuts;
 }
-const traces = firstBad(args.traces);
-const fixedTraces = firstBad(args.fixedTraces);
+const rawTraces = readTraces(args.traces);
+const rawFixedTraces = readTraces(args.fixedTraces);
+const traces = firstBad(rawTraces);
+const fixedTraces = firstBad(rawFixedTraces);
 // Classes and their shortest traces come from the customer states in every view,
 // so class N is the same bug and the same trace in the customer and developer charts.
-const classesById = new Map();
-for (const trace of traces) {
-	const rp = readerPath(trace, customerKey);
-	const last = trace.steps[trace.steps.length - 1].vars;
-	const cause = typeof mapping.cause === "function" ? String(mapping.cause(last, factsOf(last), trace.invariant)) : null;
-	const id = `${trace.invariant}${SEP}${cause ?? rp[rp.length - 1].key}`;
-	const prev = classesById.get(id);
-	if (!prev || rp.length < prev.steps || (rp.length === prev.steps && trace.steps.length < prev.trace.steps.length)) {
-		classesById.set(id, { id, cause, steps: rp.length, trace, invariant: trace.invariant, count: (prev?.count ?? 0) + 1 });
-	} else prev.count++;
+function group(cuts) {
+	const byId = new Map();
+	for (const trace of cuts) {
+		const rp = readerPath(trace, customerKey);
+		const last = trace.steps[trace.steps.length - 1].vars;
+		const cause = typeof mapping.cause === "function" ? String(mapping.cause(last, factsOf(last), trace.invariant)) : null;
+		const id = `${trace.invariant}${SEP}${cause ?? rp[rp.length - 1].key}`;
+		const prev = byId.get(id);
+		if (!prev || rp.length < prev.steps || (rp.length === prev.steps && trace.steps.length < prev.trace.steps.length)) {
+			byId.set(id, { id, cause, steps: rp.length, trace, invariant: trace.invariant, count: (prev?.count ?? 0) + 1 });
+		} else prev.count++;
+	}
+	return byId;
 }
-const classes = [...classesById.values()].sort(
-	(a, b) => a.steps - b.steps || a.trace.steps.length - b.trace.steps.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
-);
+const byOrder = (a, b) => a.steps - b.steps || a.trace.steps.length - b.trace.steps.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+const classesById = group(traces);
+const classes = [...classesById.values()].sort(byOrder);
 for (const c of classes) {
 	c.path = readerPath(c.trace);
 	c.end = c.path[c.path.length - 1].key;
 	c.fix = replayFixed(c.trace);
 }
+// A bug of the fixed model that no current bug matches is new with the fix. It numbers after the current bugs.
+useFacts(fixedIndex ?? graphIndex);
+const introduced = [...group(fixedTraces).values()].filter((c) => !classesById.has(c.id)).sort(byOrder);
+for (const c of introduced) {
+	c.path = readerPath(c.trace);
+	c.end = c.path[c.path.length - 1].key;
+	c.fix = null;
+	c.introduced = true;
+}
+useFacts(graphIndex);
+classes.push(...introduced);
 
 // ---------- status ----------
-// A chart state is still wrong when the fixed model's checks still find a first bad state in it,
-// and fixed when only the current model's checks do. Without --fixed-traces every bad state is wrong.
+// A chart state is bad when it holds a state that breaks a rule, or when every path from the start to
+// it passes such a state: what the reader sees after a bug is part of that bug. It is still wrong when
+// it is bad in the fixed model, and fixed when it is bad only in the current model.
+// Without --fixed-traces every bad state is wrong.
 const isFixed = (c) => c.fix?.key !== undefined && c.fix.key !== c.end;
-const endKeys = (list) => new Set(list.map((t) => keyOf(t.steps[t.steps.length - 1].vars)));
-const badNow = endKeys(traces);
+function badKeys(g, keys, raw) {
+	const bad = new Set(raw.map((t) => stateKey(t.steps[t.steps.length - 1].vars)));
+	const out = new Set(raw.map((t) => keyOf(t.steps[t.steps.length - 1].vars)));
+	if (!g) return out;
+	const ok = (id) => !bad.has(stateKey(g.nodes.get(id).vars));
+	const next = new Map();
+	for (const e of g.edges) {
+		if (!next.has(e.from)) next.set(e.from, []);
+		next.get(e.from).push(e.to);
+	}
+	const clean = new Set([...g.nodes.values()].filter((n) => n.init && ok(n.id)).map((n) => n.id));
+	const queue = [...clean];
+	while (queue.length) {
+		for (const to of next.get(queue.shift()) ?? []) {
+			if (clean.has(to) || !ok(to)) continue;
+			clean.add(to);
+			queue.push(to);
+		}
+	}
+	const reached = new Set([...clean].map((id) => keys.get(id)));
+	for (const k of keys.values()) if (!reached.has(k)) out.add(k);
+	return out;
+}
+const badNow = badKeys(graph, now.keys, rawTraces);
 useFacts(fixedIndex ?? graphIndex);
-const badFixed = args.fixedTraces.length > 0 ? endKeys(fixedTraces) : badNow;
+const badFixed = args.fixedTraces.length > 0 ? badKeys(fixedGraph, fixed?.keys, rawFixedTraces) : badNow;
 useFacts(graphIndex);
 const allNodes = new Set([...now.nodes, ...(fixed?.nodes ?? [])]);
 const status = (k) => (badFixed.has(k) ? "wrong" : badNow.has(k) || (fixed && !now.nodes.has(k)) ? "fixed" : "works");
@@ -229,11 +279,18 @@ if (fixed) {
 		if (!edges.has(id)) edges.set(id, { ...e, labels: new Set([...e.labels].map((l) => `${l} (with the fix)`)), fixedOnly: true });
 	}
 }
+// The fix changes one model step of the counterexample. Its edge leaves the chart state before that
+// step and ends where the fixed model goes instead, or stays put when the fix blocks the step.
+const fixEdgeId = (c) => `${c.fix.from}${SEP}${SEP}${c.fix.key}${SEP}fix`;
 for (const c of classes) {
-	if (isFixed(c)) {
-		const id = `${c.end}${SEP}${SEP}${c.fix.key}`;
-		if (!edges.has(id)) edges.set(id, { from: c.end, to: c.fix.key, labels: new Set(["with the fix"]), fixedOnly: true });
-	}
+	if (!isFixed(c)) continue;
+	const [before, after] = [c.trace.steps[c.fix.step - 1].vars, c.trace.steps[c.fix.step].vars];
+	c.fix.from = keyOf(before);
+	const said = stepLabel(c.fix.action, before, after) || c.fix.action;
+	const id = fixEdgeId(c);
+	if (!edges.has(id)) edges.set(id, { from: c.fix.from, to: c.fix.key, labels: new Set(), fixedOnly: true, fixOf: new Set() });
+	edges.get(id).labels.add(c.fix.disabled ? `${said}, blocked by the fix` : `${said}, with the fix`);
+	edges.get(id).fixOf.add(c);
 }
 
 // ---------- highlighted path ----------
@@ -279,7 +336,7 @@ if (args.cover) {
 	if (fixed) bfs(fixed, [...fixed.settled].filter((k) => !now.nodes.has(k)));
 	for (const c of classes) {
 		c.path.slice(1).forEach((p, i) => keepEdges.add(`${c.path[i].key}${SEP}${SEP}${p.key}`));
-		if (isFixed(c)) keepEdges.add(`${c.end}${SEP}${SEP}${c.fix.key}`);
+		if (isFixed(c)) keepEdges.add(fixEdgeId(c));
 	}
 	for (const id of keepEdges) {
 		if (!edges.has(id)) {
@@ -297,7 +354,7 @@ let keep = allNodes;
 if (args.pathOnly && chosen) keep = onPath;
 else if (coverEdges) {
 	keep = new Set([...now.initial, ...(fixed?.initial ?? [])]);
-	for (const id of coverEdges) for (const k of id.split(`${SEP}${SEP}`)) keep.add(k);
+	for (const id of coverEdges) keep.add(edges.get(id).from).add(edges.get(id).to);
 }
 const ids = new Map();
 let counter = 0;
@@ -311,7 +368,7 @@ if (args.title) out.push("---", `title: ${JSON.stringify(args.title)}`, "---");
 out.push("stateDiagram-v2");
 for (const c of STATUS_CLASSES) out.push(`  ${c}`);
 out.push(`  state "Legend" as ${LEGEND_ID} {`);
-out.push('    state "Works today" as legendWorks', '    state "Still wrong" as legendWrong', '    state "Fixed in an open PR" as legendFixed');
+out.push('    state "Works today" as legendWorks', '    state "Still wrong" as legendWrong', '    state "Fixed or new in an open PR" as legendFixed');
 out.push("  }", "  class legendWorks works", "  class legendWrong wrong", "  class legendFixed fixed");
 const sorted = [...keep].sort();
 if (args.view === "layered") {
@@ -323,22 +380,22 @@ if (args.view === "layered") {
 	}
 	let g = 0;
 	for (const [outer, members] of groups) {
-		out.push(`  state "${wrap(outer)}" as g${g++} {`);
-		for (const k of members) out.push(`    state "${wrap(label(k))}" as ${idOf(k)}`);
+		out.push(`  state "${quote(wrap(outer))}" as g${g++} {`);
+		for (const k of members) out.push(`    state "${quote(wrap(label(k)))}" as ${idOf(k)}`);
 		out.push("  }");
 	}
 } else {
-	for (const k of sorted) out.push(`  state "${wrap(label(k))}" as ${idOf(k)}`);
+	for (const k of sorted) out.push(`  state "${quote(wrap(label(k)))}" as ${idOf(k)}`);
 }
 const initial = new Set([...now.initial, ...(fixed?.initial ?? [])]);
 for (const k of sorted) if (initial.has(k) && (!args.pathOnly || k === chosen?.path[0].key)) out.push(`  [*] --> ${idOf(k)}`);
 let edgeCount = 0;
 for (const [id, e] of edges) {
 	if (!keep.has(e.from) || !keep.has(e.to)) continue;
-	if (args.pathOnly && !pathNumbers.has(id) && !e.labels.has("with the fix")) continue;
+	if (args.pathOnly && chosen && !pathNumbers.has(id) && !e.fixOf?.has(chosen)) continue;
 	if (coverEdges && !coverEdges.has(id)) continue;
 	const all = [...e.labels];
-	let text = all.slice(0, 2).join(" or ") + (all.length > 2 ? " or …" : "");
+	let text = args.allLabels ? all.join(" or ") : all.slice(0, 2).join(" or ") + (all.length > 2 ? " or …" : "");
 	const p = pathNumbers.get(id);
 	if (p) text = `${p.n.join(", ")}. ${p.label}`;
 	// ";" ends a Mermaid statement, even inside a transition label.
@@ -356,11 +413,12 @@ const show = (k) => (args.view === "layered" ? k.replace(SEP, ": ") : k);
 if (args.story) {
 	const lines = [];
 	classes.forEach((c, i) => {
-		lines.push(`## ${i + 1}. ${show(c.end)}`, "");
-		lines.push(`Breaks \`${c.invariant ?? "unknown"}\`${c.cause ? ` (${c.cause})` : ""}. Shortest of ${c.count} counterexample(s) that end here: ${c.trace.steps.length} model steps, ${c.path.length - 1} reader steps.`, "");
+		lines.push(`## ${i + 1}. ${c.introduced ? "New with the fix: " : ""}${show(c.end)}`, "");
+		lines.push(`Breaks \`${c.invariant}\`${c.cause ? ` (${c.cause})` : ""}. Shortest of ${c.count} counterexample(s) that end here: ${c.trace.steps.length} model steps, ${c.path.length - 1} reader steps.`, "");
 		c.path.forEach((p, j) => lines.push(j === 0 ? `0. Start: ${show(p.key)}` : `${j}. ${p.label}. Now: ${show(p.key)}`));
 		lines.push("");
-		if (!c.fix) lines.push("No fixed model given.");
+		if (c.introduced) lines.push("Only the fixed model has this bug. The path above is in the fixed model.");
+		else if (!c.fix) lines.push("No fixed model given.");
 		else if (c.fix.sameEnd) lines.push("The fixed model follows the whole trace: the fix does not change this path.");
 		else if (c.fix.reason) lines.push(`The fixed model cannot replay this trace: ${c.fix.reason}.`);
 		else lines.push(`With the fix, model step ${c.fix.step} (\`${c.fix.action}\`) ${c.fix.disabled ? "cannot happen" : "goes elsewhere"}, and you see: ${show(c.fix.key)}`);
@@ -383,8 +441,11 @@ const summary = {
 		readerSteps: c.path.length - 1,
 		modelSteps: c.trace.steps.length,
 		counterexamples: c.count,
-		fix: c.fix ? (c.fix.sameEnd ? "unchanged" : c.fix.reason ?? show(c.fix.key)) : null,
+		fix: c.introduced ? "new with the fix" : c.fix ? (c.fix.sameEnd ? "unchanged" : c.fix.reason ?? show(c.fix.key)) : null,
 	})),
 };
 if (args.summary) fs.writeFileSync(args.summary, JSON.stringify(summary, null, 2) + "\n");
-console.error(`chart: ${summary.chartStates} states, ${summary.chartTransitions} transitions from ${summary.modelStates} model states; ${classes.length} counterexample class(es)`);
+console.error(
+	`chart: ${summary.chartStates} states, ${summary.chartTransitions} transitions from ${summary.modelStates} model states; ` +
+		`${classes.length - introduced.length} bug(s)${introduced.length ? `, ${introduced.length} new with the fix` : ""}`,
+);

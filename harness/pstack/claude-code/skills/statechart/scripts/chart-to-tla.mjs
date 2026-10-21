@@ -10,6 +10,7 @@
 // A name in a never line is a state, or a composite that stands for every state inside it.
 //
 // Writes NAME.tla, NAME.cfg, and NAME.map.mjs (for tlc-to-chart.mjs) into OUT, next to the chart by default.
+// NAME.cfg names no rule; a comment in it lists the rules, and each TLC run appends one INVARIANT line.
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -120,7 +121,7 @@ out.push("Spec == Init /\\ [][Next]_vars");
 function resolve(item) {
 	const hits = [];
 	for (const [ri, x] of vars.entries()) {
-		const inside = [...x.states].filter((s) => s === item || s.startsWith(`${item}.`));
+		const inside = x.states.has(item) ? [item] : [...x.states].filter((s) => s.startsWith(`${item}.`));
 		if (inside.length) hits.push({ ri, inside });
 	}
 	if (hits.length === 0) throw new Error(`never line names "${item}", which is not a state in the chart`);
@@ -142,7 +143,9 @@ for (const n of nevers) {
 }
 out.push("", "====", "");
 
-const cfg = ["SPECIFICATION Spec", "INVARIANT TypeOK", ...invariants.map((n) => `INVARIANT ${n}`), ""];
+// TLC reports only the first rule a state breaks, so the config names no rule and each TLC run appends one.
+const rules = ["TypeOK", ...invariants];
+const cfg = ["SPECIFICATION Spec", `\\* Rules, one TLC run each: ${rules.join(" ")}`, ""];
 
 const labels = Object.fromEntries(actions.map((a) => [a.name, a.label]));
 const map = [
@@ -150,6 +153,8 @@ const map = [
 	`export const regions = ${JSON.stringify(vars.map((x) => x.v))};`,
 	`const LABELS = ${JSON.stringify(labels, null, "\t")};`,
 	"",
+	"// The actions the reader takes. facts.settled and --cover need them. Add cause() and detail() as the spec grows.",
+	"export const readerActions = [];",
 	'export const state = (v) => regions.map((r) => v[r]).join(" | ");',
 	"export const step = (action) => LABELS[action] ?? action;",
 	"",
@@ -160,5 +165,5 @@ fs.writeFileSync(path.join(dir, `${args.module}.tla`), out.join("\n"));
 fs.writeFileSync(path.join(dir, `${args.module}.cfg`), cfg.join("\n"));
 fs.writeFileSync(path.join(dir, `${args.module}.map.mjs`), map.join("\n"));
 console.error(
-	`${args.module}: ${vars.length} region variable(s), ${actions.length} action(s), ${invariants.length} invariant(s) -> ${path.join(dir, args.module)}.{tla,cfg,map.mjs}`,
+	`${args.module}: ${vars.length} region variable(s), ${actions.length} action(s), rules ${rules.join(" ")} -> ${path.join(dir, args.module)}.{tla,cfg,map.mjs}`,
 );
