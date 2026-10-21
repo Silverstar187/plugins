@@ -1,91 +1,104 @@
 #!/usr/bin/env node
-// Compare two Mermaid stateDiagram-v2 charts: reachable states, start states, and labeled transitions.
-//
-//   node compare-charts.mjs EXPECTED.mmd ACTUAL.mmd
-//
-// Use it to check that a spec still draws the chart the reader agreed to: EXPECTED is the agreed chart,
-// ACTUAL is what tlc-to-chart.mjs drew from the spec in the customer view with --highlight 0 --all-labels,
-// without --cover or --fixed-dot. A chart with parallel regions compares as its combined machine
-// (productOf in lib.mjs), so a guard that blocks a step in only some combinations of regions shows as a
-// difference. A combined state is the region states joined by " | " in region order, which is what
-// chart-to-tla.mjs's mapping writes. An edge label "a or b" counts as two labels. An unlabeled edge counts
-// only when no labeled edge joins the same two states, because tlc-to-chart.mjs draws only the labels.
-// Exits 1 when the charts differ, and 2 when it cannot read a chart or ACTUAL is not drawn for comparison.
 import fs from "node:fs";
 import process from "node:process";
-import { parseMermaid, productOf } from "./lib.mjs";
+import { LEGEND_ID, compareCharts, parseMermaid } from "./lib.mjs";
 
-const [expectedFile, actualFile] = process.argv.slice(2);
-if (!expectedFile || !actualFile) {
-	console.error("Usage: node compare-charts.mjs EXPECTED.mmd ACTUAL.mmd");
-	process.exit(2);
+const USAGE = "Usage: node compare-charts.mjs EXPECTED.mmd ACTUAL.mmd";
+const HELP = `${USAGE}
+
+Compares two Mermaid stateDiagram-v2 charts: reachable states, start states, and labeled
+transitions. statechart.mjs from-chart runs it to check that the spec still draws the chart that
+the reader agreed to.
+
+EXPECTED is the agreed chart. ACTUAL is what tlc-to-chart.mjs drew from the spec in the customer
+view with --highlight 0 --all-labels --flat, without --cover, --fixed-dot, or --against-dot. Each
+chart compares as the
+machine that its steps reach from its start states. A chart with parallel regions compares as its
+combined machine, so a guard that blocks a step in only some combinations of regions shows as a
+difference. A "%% when ID, ID" or "%% when not ID, ID" line right after a transition is its guard:
+the step happens only while another region is in, or not in, one of those states. The label ends
+with the guard's words in [ ], which are not part of the label. A combined state is the region
+states joined by " | " in region order, which is what chart-to-tla.mjs's mapping writes. A step that does not change the state is not compared, because
+tlc-to-chart.mjs does not draw it. An edge label "a or b" counts as two labels. An unlabeled edge
+counts only when no labeled edge joins the same two states, because tlc-to-chart.mjs draws only
+the labels.
+
+  -h, --help  Print this help, and exit 0.
+
+Prints each difference and then "N difference(s)", or prints "same". Writes no file.
+
+Exit codes
+  0  The charts are the same.
+  1  The charts differ.
+  2  A bad argument, a chart that it cannot read, or an ACTUAL chart that is not drawn for
+     comparison.`;
+const more = "Run node compare-charts.mjs --help for the flags.";
+
+const files = [];
+for (const a of process.argv.slice(2)) {
+  if (a === "-h" || a === "--help") {
+    console.log(HELP);
+    process.exit(0);
+  } else if (a.startsWith("-") || files.length === 2) {
+    console.error(`unknown argument ${a}. ${more}`);
+    process.exit(2);
+  } else files.push(a);
 }
+if (files.length < 2) {
+  console.error(`${USAGE}\n${more}`);
+  process.exit(2);
+}
+const [expectedFile, actualFile] = files;
 
-const machine = (regions) => {
-	const rs = Object.values(regions);
-	return rs.length === 1 ? rs[0] : productOf(regions);
+const orExit = (file, f) => {
+  try {
+    return f();
+  } catch (e) {
+    console.error(`${file}: ${e.message}`);
+    process.exit(2);
+  }
 };
-const read = (file) => {
-	try {
-		return parseMermaid(fs.readFileSync(file, "utf8")).regions;
-	} catch (e) {
-		console.error(`${file}: ${e.message}`);
-		process.exit(2);
-	}
-};
-const expectedRegions = read(expectedFile);
-const expected = machine(expectedRegions);
-const actual = machine(read(actualFile));
+const [expectedText, actualText] = files.map((f) => orExit(f, () => fs.readFileSync(f, "utf8")));
+const textRefusals = [
+  [
+    /^\s*%% second model/m,
+    "it has a second model; draw ACTUAL without --fixed-dot or --against-dot",
+  ],
+  [
+    new RegExp(`^\\s*state\\s+"[^"]*"\\s+as\\s+(?!${LEGEND_ID}\\b)\\w+\\s*\\{`, "m"),
+    "it has boxes; draw ACTUAL with --flat",
+  ],
+];
+for (const [bad, why] of textRefusals) {
+  if (bad.test(actualText)) {
+    console.error(`${actualFile}: ${why}`);
+    process.exit(2);
+  }
+}
+const expectedRegions = orExit(expectedFile, () => parseMermaid(expectedText).regions);
+const actualRegions = orExit(actualFile, () => parseMermaid(actualText).regions);
+const drawn = Object.values(actualRegions).flatMap((r) => r.transitions);
 
 const refusals = [
-	[(l) => / or …$/.test(l), "an edge label ends in \" or …\"; draw ACTUAL with --all-labels"],
-	[(l) => /^\d+(, \d+)*\. /.test(l), "an edge label is a numbered path step; draw ACTUAL with --highlight 0"],
-	[(l) => /with the fix\)?$|blocked by the fix$/.test(l), "an edge comes from the fixed model; draw ACTUAL without --fixed-dot"],
+  [(l) => / or …$/.test(l), 'an edge label ends in " or …"; draw ACTUAL with --all-labels'],
+  [
+    (l) => /^\d+(, \d+)*\. /.test(l),
+    "an edge label is a numbered path step; draw ACTUAL with --highlight 0",
+  ],
 ];
 for (const [bad, why] of refusals) {
-	if (actual.transitions.some((t) => bad(t.label))) {
-		console.error(`${actualFile}: ${why}`);
-		process.exit(2);
-	}
+  if (drawn.some((t) => bad(t.label))) {
+    console.error(`${actualFile}: ${why}`);
+    process.exit(2);
+  }
 }
 
-const edgeSet = (m) => {
-	const labeled = new Set();
-	const out = new Set();
-	for (const t of m.transitions) {
-		if (!t.label) continue;
-		labeled.add(`${t.from} --> ${t.to}`);
-		for (const l of t.label.split(" or ")) out.add(`${t.from} --> ${t.to} : ${l}`);
-	}
-	for (const t of m.transitions) if (!t.label && !labeled.has(`${t.from} --> ${t.to}`)) out.add(`${t.from} --> ${t.to}`);
-	return out;
-};
-const minus = (a, b) => [...a].filter((x) => !b.has(x)).sort();
-
-// A region state that no combination of the agreed chart's own steps reaches can never be drawn.
-const unreached = [];
-if (Object.keys(expectedRegions).length > 1) {
-	Object.entries(expectedRegions).forEach(([name, r], ri) => {
-		const seen = new Set([...expected.states].map((s) => s.split(" | ")[ri]));
-		for (const s of r.states) if (!seen.has(s)) unreached.push(`${name}: ${s}`);
-	});
-}
-
-const rows = [
-	["region states the agreed chart's own steps never reach", unreached.sort()],
-	["states only in EXPECTED (no path from the start reaches them in the spec, or the spec renamed them)", minus(expected.states, actual.states)],
-	["states only in ACTUAL", minus(actual.states, expected.states)],
-	["start states only in EXPECTED", minus(expected.initial, actual.initial)],
-	["start states only in ACTUAL", minus(actual.initial, expected.initial)],
-	["transitions only in EXPECTED (a guard in the spec blocks them, or the spec renamed the step)", minus(edgeSet(expected), edgeSet(actual))],
-	["transitions only in ACTUAL", minus(edgeSet(actual), edgeSet(expected))],
-].filter(([, xs]) => xs.length > 0);
-
+const rows = compareCharts(expectedRegions, actualRegions);
 let differences = 0;
 for (const [title, xs] of rows) {
-	console.log(`${title}:`);
-	for (const x of xs) console.log(`  ${x}`);
-	differences += xs.length;
+  console.log(`${title}:`);
+  for (const x of xs) console.log(`  ${x}`);
+  differences += xs.length;
 }
 console.log(differences === 0 ? "same" : `${differences} difference(s)`);
 process.exit(differences === 0 ? 0 : 1);

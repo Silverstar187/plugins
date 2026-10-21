@@ -1,35 +1,54 @@
 #!/usr/bin/env node
-// Write a TLA+ spec, a TLC config, and a reader mapping from a Mermaid stateDiagram-v2.
-//
-//   node chart-to-tla.mjs CHART.mmd --module NAME [--dir OUT]
-//
-// Each region becomes one variable whose values are the region's states.
-// Each transition label becomes one action. Regions that share a label move together:
-// every region that can take it does, the others stay. An unlabeled transition is its own action.
-// Each "%% never NAME: A & B -- sentence" line becomes the invariant NAME == ~(A /\ B).
-// A name in a never line is a state, or a composite that stands for every state inside it.
-//
-// Writes NAME.tla, NAME.cfg, and NAME.map.mjs (for tlc-to-chart.mjs) into OUT, next to the chart by default.
-// NAME.cfg names no rule; a comment in it lists the rules, and each TLC run appends one INVARIANT line.
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { parseMermaid } from "./lib.mjs";
 
+const USAGE = "Usage: node chart-to-tla.mjs CHART.mmd --module NAME [--dir OUT]";
+const HELP = `${USAGE}
+
+Writes a TLA+ spec, a TLC config, and a reader mapping from a Mermaid stateDiagram-v2.
+statechart.mjs from-chart runs it, then checks each INVARIANT in NAME.cfg alone.
+
+Each region becomes one variable whose values are the region's states. Each transition label
+becomes one action. Regions that share a label move together: every region that can take it does,
+and the others stay. A "%% when" line after a transition is its guard: the region can take that
+transition only while the other regions are in, or with "not" are not in, the states it names. An
+unlabeled transition is its own action. Each
+"%% never NAME: A & B -- sentence" line becomes the invariant NAME == ~(A /\\ B). A name in a
+never line is a state, or a composite that stands for every state inside it.
+
+  --module NAME  The TLA+ module name. Required.
+  --dir OUT      The folder for the files. Default: the chart's folder.
+  -h, --help     Print this help, and exit 0.
+
+Writes NAME.tla, NAME.cfg, and NAME.map.mjs into OUT, and replaces files with those names.
+NAME.cfg has SPECIFICATION Spec, INVARIANT TypeOK, and one INVARIANT per never line.
+NAME.map.mjs gives tlc-to-chart.mjs the reader's words: the region states joined by " | ".
+
+Exit codes
+  0  It wrote the files.
+  1  It cannot read the chart. The error says why.
+  2  A bad argument.`;
+const more = "Run node chart-to-tla.mjs --help for the flags.";
+
 const args = {};
 for (let i = 2; i < process.argv.length; i++) {
-	const a = process.argv[i];
-	if (a === "--module") args.module = process.argv[++i];
-	else if (a === "--dir") args.dir = process.argv[++i];
-	else if (!a.startsWith("--") && !args.chart) args.chart = a;
-	else {
-		console.error(`unknown argument ${a}`);
-		process.exit(2);
-	}
+  const a = process.argv[i];
+  if (a === "-h" || a === "--help") {
+    console.log(HELP);
+    process.exit(0);
+  } else if (a === "--module") args.module = process.argv[++i];
+  else if (a === "--dir") args.dir = process.argv[++i];
+  else if (!a.startsWith("-") && !args.chart) args.chart = a;
+  else {
+    console.error(`unknown argument ${a}. ${more}`);
+    process.exit(2);
+  }
 }
 if (!args.chart || !/^[A-Za-z][A-Za-z0-9_]*$/.test(args.module ?? "")) {
-	console.error("Usage: node chart-to-tla.mjs CHART.mmd --module NAME [--dir OUT]");
-	process.exit(2);
+  console.error(`${USAGE}\n${more}`);
+  process.exit(2);
 }
 const dir = args.dir ?? path.dirname(args.chart);
 const { regions, nevers } = parseMermaid(fs.readFileSync(args.chart, "utf8"));
@@ -37,42 +56,62 @@ const { regions, nevers } = parseMermaid(fs.readFileSync(args.chart, "utf8"));
 const RESERVED = new Set(["vars", "Init", "Next", "Spec", "TypeOK", "Settled"]);
 const taken = new Set(RESERVED);
 function ident(words, lower) {
-	const parts = words.normalize("NFKD").replace(/[^A-Za-z0-9]+/g, " ").trim().split(" ").filter(Boolean);
-	let id = parts.map((p, i) => (lower && i === 0 ? p[0].toLowerCase() : p[0].toUpperCase()) + p.slice(1)).join("") || "Step";
-	if (/^[0-9]/.test(id)) id = `${lower ? "r" : "S"}${id}`;
-	let unique = id;
-	for (let n = 2; taken.has(unique); n++) unique = `${id}${n}`;
-	taken.add(unique);
-	return unique;
+  const parts = words
+    .normalize("NFKD")
+    .replace(/[^A-Za-z0-9]+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+  let id =
+    parts
+      .map((p, i) => (lower && i === 0 ? p[0].toLowerCase() : p[0].toUpperCase()) + p.slice(1))
+      .join("") || "Step";
+  if (/^[0-9]/.test(id)) id = `${lower ? "r" : "S"}${id}`;
+  let unique = id;
+  for (let n = 2; taken.has(unique); n++) unique = `${id}${n}`;
+  taken.add(unique);
+  return unique;
 }
 const str = (s) => `"${s.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 const set = (xs) => `{${[...xs].map(str).join(", ")}}`;
 
 const vars = Object.entries(regions).map(([name, r]) => {
-	if (r.states.size === 0) throw new Error(`region ${name} has no states`);
-	if (r.initial.size === 0) throw new Error(`region ${name} has no [*] --> start`);
-	return { name, v: ident(name, true), ...r };
+  if (r.states.size === 0) throw new Error(`region ${name} has no states`);
+  if (r.initial.size === 0) throw new Error(`region ${name} has no [*] --> start`);
+  return { name, v: ident(name, true), ...r };
 });
+
+// A guard reads the other regions in the state before the step.
+function guardOf(g) {
+  if (!g) return null;
+  const parts = Object.entries(g.states).map(([name, states]) => {
+    const { v } = vars.find((x) => x.name === name);
+    return states.length === 1 ? `${v} = ${str(states[0])}` : `${v} \\in ${set(states)}`;
+  });
+  return g.not ? `~(${parts.join(" \\/ ")})` : parts.join(" /\\ ");
+}
 
 // One action per label. Unlabeled transitions get one action each.
 const actions = [];
 const byLabel = new Map();
 for (const [ri, r] of vars.entries()) {
-	for (const t of r.transitions) {
-		let a = t.label ? byLabel.get(t.label) : null;
-		if (!a) {
-			a = { label: t.label, moves: new Map() };
-			actions.push(a);
-			if (t.label) byLabel.set(t.label, a);
-		}
-		if (!a.moves.has(ri)) a.moves.set(ri, []);
-		const moves = a.moves.get(ri);
-		if (!moves.some((m) => m.from === t.from && m.to === t.to)) moves.push({ from: t.from, to: t.to });
-	}
+  for (const t of r.transitions) {
+    let a = t.label ? byLabel.get(t.label) : null;
+    if (!a) {
+      a = { label: t.label, moves: new Map() };
+      actions.push(a);
+      if (t.label) byLabel.set(t.label, a);
+    }
+    if (!a.moves.has(ri)) a.moves.set(ri, []);
+    const moves = a.moves.get(ri);
+    const when = guardOf(t.guard);
+    if (!moves.some((m) => m.from === t.from && m.to === t.to && m.when === when))
+      moves.push({ from: t.from, to: t.to, when });
+  }
 }
 for (const a of actions) {
-	const only = a.label ? null : [...a.moves.values()][0][0];
-	a.name = ident(a.label || `${only.from} to ${only.to}`, false);
+  const only = a.label ? null : [...a.moves.values()][0][0];
+  a.name = ident(a.label || `${only.from} to ${only.to}`, false);
 }
 
 const out = [];
@@ -80,84 +119,132 @@ const bullet = (indent, op, lines) => lines.map((l, i) => `${" ".repeat(indent)}
 out.push(`---- MODULE ${args.module} ----`);
 out.push(`\\* Generated by chart-to-tla.mjs from ${path.basename(args.chart)}.`);
 out.push("\\* Each region is one variable and each transition label is one action.");
-out.push("\\* Once you add guards and variables from the real code, this file is the source:");
-out.push("\\* draw the chart from it with tlc-to-chart.mjs and check it with compare-charts.mjs.");
+out.push("\\* Once you add guards and variables from the real code, this file is the source.");
+out.push(
+  `\\* statechart.mjs from-chart ${path.basename(args.chart)} keeps it, checks it, and compares it with the chart.`,
+);
 out.push("");
 out.push(`VARIABLES ${vars.map((x) => x.v).join(", ")}`);
 out.push(`vars == <<${vars.map((x) => x.v).join(", ")}>>`);
 out.push("");
-for (const x of vars) out.push(`\\* Region ${x.name}`, `${x.v}States == ${set([...x.states].sort())}`);
+for (const x of vars)
+  out.push(`\\* Region ${x.name}`, `${x.v}States == ${set([...x.states].sort())}`);
 out.push("");
-out.push("TypeOK ==", ...bullet(4, "/\\", vars.map((x) => `${x.v} \\in ${x.v}States`)));
+out.push(
+  "TypeOK ==",
+  ...bullet(
+    4,
+    "/\\",
+    vars.map((x) => `${x.v} \\in ${x.v}States`),
+  ),
+);
 out.push("");
-out.push("Init ==", ...bullet(4, "/\\", vars.map((x) => (x.initial.size === 1 ? `${x.v} = ${str([...x.initial][0])}` : `${x.v} \\in ${set(x.initial)}`))));
+out.push(
+  "Init ==",
+  ...bullet(
+    4,
+    "/\\",
+    vars.map((x) =>
+      x.initial.size === 1 ? `${x.v} = ${str([...x.initial][0])}` : `${x.v} \\in ${set(x.initial)}`,
+    ),
+  ),
+);
 for (const a of actions) {
-	out.push("");
-	if (a.label) out.push(`\\* ${a.label}`);
-	out.push(`${a.name} ==`);
-	const moving = [...a.moves.keys()];
-	const conj = [];
-	if (moving.length > 1) conj.push(`(${moving.map((ri) => `${vars[ri].v} \\in ${set(new Set(a.moves.get(ri).map((m) => m.from)))}`).join(" \\/ ")})`);
-	const blocks = [];
-	for (const ri of moving) {
-		const v = vars[ri].v;
-		const ds = a.moves.get(ri).map((m) => `(${v} = ${str(m.from)} /\\ ${v}' = ${str(m.to)})`);
-		if (moving.length > 1) ds.push(`(${v} \\notin ${set(new Set(a.moves.get(ri).map((m) => m.from)))} /\\ UNCHANGED ${v})`);
-		blocks.push(ds);
-	}
-	const still = vars.filter((_, ri) => !a.moves.has(ri)).map((x) => x.v);
-	for (const c of conj) out.push(`    /\\ ${c}`);
-	for (const ds of blocks) {
-		out.push(`    /\\ \\/ ${ds[0]}`);
-		for (const d of ds.slice(1)) out.push(`       \\/ ${d}`);
-	}
-	if (still.length) out.push(`    /\\ UNCHANGED <<${still.join(", ")}>>`);
+  out.push("");
+  if (a.label) out.push(`\\* ${a.label}`);
+  out.push(`${a.name} ==`);
+  const moving = [...a.moves.keys()];
+  // Whether region ri can take the action, or with `not`, cannot.
+  const can = (ri, not) => {
+    const v = vars[ri].v;
+    const moves = a.moves.get(ri);
+    if (moves.every((m) => !m.when))
+      return `${v} ${not ? "\\notin" : "\\in"} ${set(new Set(moves.map((m) => m.from)))}`;
+    const any = moves
+      .map((m) => `(${v} = ${str(m.from)}${m.when ? ` /\\ ${m.when}` : ""})`)
+      .join(" \\/ ");
+    return not ? `~(${any})` : any;
+  };
+  const conj = [];
+  if (moving.length > 1) conj.push(`(${moving.map((ri) => can(ri, false)).join(" \\/ ")})`);
+  const blocks = [];
+  for (const ri of moving) {
+    const v = vars[ri].v;
+    const ds = a.moves
+      .get(ri)
+      .map(
+        (m) => `(${v} = ${str(m.from)}${m.when ? ` /\\ ${m.when}` : ""} /\\ ${v}' = ${str(m.to)})`,
+      );
+    if (moving.length > 1) ds.push(`(${can(ri, true)} /\\ UNCHANGED ${v})`);
+    blocks.push(ds);
+  }
+  const still = vars.filter((_, ri) => !a.moves.has(ri)).map((x) => x.v);
+  for (const c of conj) out.push(`    /\\ ${c}`);
+  for (const ds of blocks) {
+    out.push(`    /\\ \\/ ${ds[0]}`);
+    for (const d of ds.slice(1)) out.push(`       \\/ ${d}`);
+  }
+  if (still.length) out.push(`    /\\ UNCHANGED <<${still.join(", ")}>>`);
 }
 out.push("");
-out.push(actions.length ? `Next == ${actions.map((a) => a.name).join(" \\/ ")}` : "Next == UNCHANGED vars");
+out.push(
+  actions.length ? `Next == ${actions.map((a) => a.name).join(" \\/ ")}` : "Next == UNCHANGED vars",
+);
 out.push("");
 out.push("Spec == Init /\\ [][Next]_vars");
 
 function resolve(item) {
-	const hits = [];
-	for (const [ri, x] of vars.entries()) {
-		const inside = x.states.has(item) ? [item] : [...x.states].filter((s) => s.startsWith(`${item}.`));
-		if (inside.length) hits.push({ ri, inside });
-	}
-	if (hits.length === 0) throw new Error(`never line names "${item}", which is not a state in the chart`);
-	if (hits.length > 1) throw new Error(`never line names "${item}", which is a state in regions ${hits.map((h) => vars[h.ri].name).join(" and ")}; rename one`);
-	return hits[0];
+  const hits = [];
+  for (const [ri, x] of vars.entries()) {
+    const inside = x.states.has(item)
+      ? [item]
+      : [...x.states].filter((s) => s.startsWith(`${item}.`));
+    if (inside.length) hits.push({ ri, inside });
+  }
+  if (hits.length === 0)
+    throw new Error(`never line names "${item}", which is not a state in the chart`);
+  if (hits.length > 1)
+    throw new Error(
+      `never line names "${item}", which is a state in regions ${hits.map((h) => vars[h.ri].name).join(" and ")}; rename one`,
+    );
+  return hits[0];
 }
 const invariants = [];
 for (const n of nevers) {
-	if (taken.has(n.name)) throw new Error(`never name ${n.name} is already used in the spec`);
-	taken.add(n.name);
-	const parts = n.states.map(resolve);
-	const regionsUsed = new Set(parts.map((p) => p.ri));
-	if (regionsUsed.size !== parts.length) throw new Error(`never ${n.name} names two states of one region; one region is in one state at a time`);
-	const cond = parts.map((p) => (p.inside.length === 1 ? `${vars[p.ri].v} = ${str(p.inside[0])}` : `${vars[p.ri].v} \\in ${set(p.inside)}`));
-	out.push("");
-	if (n.sentence) out.push(`\\* ${n.sentence}`);
-	out.push(`${n.name} == ~(${cond.join(" /\\ ")})`);
-	invariants.push(n.name);
+  if (taken.has(n.name)) throw new Error(`never name ${n.name} is already used in the spec`);
+  taken.add(n.name);
+  const parts = n.states.map(resolve);
+  const regionsUsed = new Set(parts.map((p) => p.ri));
+  if (regionsUsed.size !== parts.length)
+    throw new Error(
+      `never ${n.name} names two states of one region; one region is in one state at a time`,
+    );
+  const cond = parts.map((p) =>
+    p.inside.length === 1
+      ? `${vars[p.ri].v} = ${str(p.inside[0])}`
+      : `${vars[p.ri].v} \\in ${set(p.inside)}`,
+  );
+  out.push("");
+  if (n.sentence) out.push(`\\* ${n.sentence}`);
+  out.push(`${n.name} == ~(${cond.join(" /\\ ")})`);
+  invariants.push(n.name);
 }
 out.push("", "====", "");
 
-// TLC reports only the first rule a state breaks, so the config names no rule and each TLC run appends one.
 const rules = ["TypeOK", ...invariants];
-const cfg = ["SPECIFICATION Spec", `\\* Rules, one TLC run each: ${rules.join(" ")}`, ""];
+const cfg = ["SPECIFICATION Spec", ...rules.map((r) => `INVARIANT ${r}`), ""];
 
 const labels = Object.fromEntries(actions.map((a) => [a.name, a.label]));
 const map = [
-	`// Generated by chart-to-tla.mjs from ${path.basename(args.chart)}. Reader states are the chart's own states.`,
-	`export const regions = ${JSON.stringify(vars.map((x) => x.v))};`,
-	`const LABELS = ${JSON.stringify(labels, null, "\t")};`,
-	"",
-	"// The actions the reader takes. facts.settled and --cover need them. Add cause() and detail() as the spec grows.",
-	"export const readerActions = [];",
-	'export const state = (v) => regions.map((r) => v[r]).join(" | ");',
-	"export const step = (action) => LABELS[action] ?? action;",
-	"",
+  `// Generated by chart-to-tla.mjs from ${path.basename(args.chart)}. Reader states are the chart's own states.`,
+  `export const regions = ${JSON.stringify(vars.map((x) => x.v))};`,
+  `const LABELS = ${JSON.stringify(labels, null, "\t")};`,
+  "",
+  "// The actions the reader takes. facts.settled needs them. Add cause() and detail() as the spec grows.",
+  "export const readerActions = [];",
+  'export const state = (v) => regions.map((r) => v[r]).join(" | ");',
+  "export const step = (action) => LABELS[action] ?? action;",
+  "",
 ];
 
 fs.mkdirSync(dir, { recursive: true });
@@ -165,5 +252,5 @@ fs.writeFileSync(path.join(dir, `${args.module}.tla`), out.join("\n"));
 fs.writeFileSync(path.join(dir, `${args.module}.cfg`), cfg.join("\n"));
 fs.writeFileSync(path.join(dir, `${args.module}.map.mjs`), map.join("\n"));
 console.error(
-	`${args.module}: ${vars.length} region variable(s), ${actions.length} action(s), rules ${rules.join(" ")} -> ${path.join(dir, args.module)}.{tla,cfg,map.mjs}`,
+  `${args.module}: ${vars.length} region variable(s), ${actions.length} action(s), rules ${rules.join(" ")} -> ${path.join(dir, args.module)}.{tla,cfg,map.mjs}`,
 );

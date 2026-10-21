@@ -127,6 +127,8 @@ A counterexample in model terms convinces you. The PM or designer who owns the b
 
 It also runs the other way. Sketch the behavior as a chart, agree on it with the reader, and the skill writes a TLA+ skeleton from it. TLC checks the agreed chart's rules before any code exists. As guards from the real code go into the spec, each place the code departs from the chart shows up as a difference for the reader to decide.
 
+When the code already has a TLA+ spec, the skill can audit the code against it. The agent models what the code does and checks that model next to the unchanged spec. The chart marks the steps where the two differ, and each rule either one breaks is a numbered path.
+
 ## Open the PR
 
 ```text
