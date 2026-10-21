@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -981,6 +981,40 @@ Wrote chart.mmd, stories.md, summary.json in Sync-statechart.
     "tlc",
   ]);
 });
+
+test(
+  "--png exits 2 when a chart does not render, even with --expect-broken, and keeps the other files",
+  needsTlc,
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "statechart-"));
+    writeFileSync(join(dir, "sync.mmd"), fixture("sync.mmd"));
+    const args = ["from-chart", "sync.mmd", "--expect-broken", "NeverSyncedWhileOffline"];
+    assert.equal(node("statechart.mjs", args, dir).status, 0);
+    // An npx whose mermaid-cli cannot launch a headless browser.
+    const bin = mkdtempSync(join(tmpdir(), "no-browser-"));
+    const launch = "Error: Failed to launch the browser process!";
+    writeFileSync(join(bin, "npx"), `#!/bin/sh\necho "${launch}" >&2\nexit 1\n`, { mode: 0o755 });
+    const r = node("statechart.mjs", [...args, "--png"], dir, {
+      PATH: `${bin}${delimiter}${process.env.PATH}`,
+    });
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.equal(
+      r.stderr,
+      `could not render Sync-statechart/chart.mmd: ${launch}\ncould not render Sync-statechart/bug-1.mmd: ${launch}\n`,
+    );
+    assert.match(
+      r.stdout,
+      /\nBroken as expected: NeverSyncedWhileOffline\.\n(.*\n)*Wrote chart\.mmd, bug-1\.mmd, stories\.md, summary\.json in Sync-statechart\.\n$/,
+    );
+    assert.deepEqual(readdirSync(join(dir, "Sync-statechart")).sort(), [
+      "bug-1.mmd",
+      "chart.mmd",
+      "stories.md",
+      "summary.json",
+      "tlc",
+    ]);
+  },
+);
 
 const pay = (name, charge) => `---- MODULE ${name} ----
 EXTENDS Naturals

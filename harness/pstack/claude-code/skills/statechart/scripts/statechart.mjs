@@ -131,7 +131,9 @@ Exit codes
   1  Another rule is broken, an expected rule holds, or the chart that the spec draws is not
      CHART.mmd. The output says which.
   2  The command cannot finish: a bad argument, a missing file, a chart or TLC output that it
-     cannot read, no TLC, or a new mapping to fill in.`;
+     cannot read, no TLC, a new mapping to fill in, or a chart that --png cannot render. When a
+     chart does not render, the command keeps the files it wrote and exits 2, whatever the rules
+     give.`;
 
 const HELP = {
   "": `${usage([...Object.values(USAGE), "node statechart.mjs [from-spec|from-chart] --help"])}
@@ -470,7 +472,7 @@ function finish(out, charts, files, ok) {
   const pngs = args.png ? render(charts) : [];
   const written = [...charts, ...pngs, ...files.slice(1)].map((f) => path.basename(f)).join(", ");
   console.log(`\nWrote ${written} in ${rel(out)}.`);
-  process.exit(ok ? 0 : 1);
+  process.exit(args.png && pngs.length < charts.length ? 2 : ok ? 0 : 1);
 }
 
 const outDir = (name) => {
