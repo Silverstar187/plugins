@@ -314,6 +314,7 @@ export function parseMermaid(text) {
 		throw new Error(`cannot read chart line: ${line}`);
 	}
 	if (stack.length !== 1) throw new Error("the chart has an unclosed {");
+	if (root.parts.length > 1) throw new Error("the chart has -- outside a composite; to make parallel regions, split one top-level composite with --");
 
 	// Ids are global, as in Mermaid: a transition may name a state declared inside another composite.
 	// A composite's full name prefixes its children ("Parent.Child"). An id used only in a

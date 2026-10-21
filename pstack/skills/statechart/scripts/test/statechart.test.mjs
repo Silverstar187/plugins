@@ -291,6 +291,23 @@ test("compare reads parallel regions as one machine, so a guard across regions s
 	assert.equal(same.stdout.trim(), "same", same.stdout);
 });
 
+test("a -- outside a composite is refused, not read as one region", () => {
+	const split = "stateDiagram-v2\n  [*] --> Online\n  Online --> Offline : the network drops\n  --\n  [*] --> Synced\n  Synced --> Pending : you edit a note\n";
+	assert.throws(() => parseMermaid(split), /-- outside a composite/);
+	const dir = mkdtempSync(join(tmpdir(), "statechart-"));
+	writeFileSync(join(dir, "split.mmd"), split);
+	writeFileSync(join(dir, "door.mmd"), door);
+	const tla = node("chart-to-tla.mjs", ["split.mmd", "--module", "Split"], dir);
+	assert.notEqual(tla.status, 0);
+	assert.match(tla.stderr, /-- outside a composite/);
+	for (const pair of [["split.mmd", "split.mmd"], ["door.mmd", "split.mmd"], ["split.mmd", "door.mmd"]]) {
+		const r = node("compare-charts.mjs", pair, dir);
+		assert.notEqual(r.status, 0, pair.join(" "));
+		assert.notEqual(r.stdout.trim(), "same");
+		assert.match(r.stderr, /-- outside a composite/);
+	}
+});
+
 test("compare refuses an ACTUAL chart that is not drawn for comparison", () => {
 	const dir = mkdtempSync(join(tmpdir(), "statechart-"));
 	writeFileSync(join(dir, "agreed.mmd"), door);

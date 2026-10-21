@@ -95,7 +95,7 @@ With `-continue`, TLC exits 0 after a broken rule, and its output still ends wit
    %% never NeverSyncedWhileOffline: Offline & Synced -- You never see "Synced" while you are offline.
    ```
 
-   Each name in a `never` line is a state caption, or a composite that stands for every state inside it. The names must come from different regions. Each state needs its own caption. The parser refuses what it cannot model: final states (`X --> [*]`), choice, fork, and history states, and regions below the top level. Draw "the app closes" as an edge to the state the reader sees next, and "comes back to where it was" as an edge to that state.
+   Each name in a `never` line is a state caption, or a composite that stands for every state inside it. The names must come from different regions. Each state needs its own caption. The parser refuses what it cannot model: final states (`X --> [*]`), choice, fork, and history states, regions below the top level, and a `--` outside a composite. Draw "the app closes" as an edge to the state the reader sees next, and "comes back to where it was" as an edge to that state.
 
 2. **Generate the skeleton.** `node scripts/chart-to-tla.mjs chart.mmd --module Sync` writes `Sync.tla`, `Sync.cfg`, and `Sync.map.mjs`, and prints the rules. `Sync.cfg` names no rule, and a comment in it lists them. Fill in `readerActions` in `Sync.map.mjs` with the actions the reader takes.
 
